@@ -7,6 +7,7 @@
 """
 
 import logging
+import re
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -21,6 +22,9 @@ from .database import Base, engine, get_db
 from .hashing import HASH_SCHEME, compute_commitment
 from .models import Commitment, Event, Reveal
 from .schemas import (
+    COMMITMENT_HASH_PATTERN,
+    CommitmentBatchCreate,
+    CommitmentBatchOut,
     CommitmentCreate,
     CommitmentOut,
     ConflictRequest,
@@ -32,6 +36,11 @@ from .schemas import (
     RevealOut,
     TimelineOut,
 )
+
+# 批量提交逐项冲突类型
+INVALID_FORMAT = "INVALID_FORMAT"
+DUPLICATE_IN_REQUEST = "DUPLICATE_IN_REQUEST"
+DUPLICATE_COMMITMENT = "DUPLICATE_COMMITMENT"
 
 logger = logging.getLogger("sealed-predictions")
 
@@ -56,8 +65,16 @@ def event_status(event: Event, now: datetime) -> str:
     return "closed"
 
 
-def api_error(status_code: int, code: str, message: str) -> HTTPException:
-    return HTTPException(status_code=status_code, detail={"code": code, "message": message})
+def api_error(
+    status_code: int,
+    code: str,
+    message: str,
+    conflicts: list[dict] | None = None,
+) -> HTTPException:
+    detail: dict = {"code": code, "message": message}
+    if conflicts is not None:
+        detail["conflicts"] = conflicts
+    return HTTPException(status_code=status_code, detail=detail)
 
 
 @asynccontextmanager
@@ -261,6 +278,128 @@ def submit_commitment(event_id: UUID, payload: CommitmentCreate, db: Session = D
         db.rollback()
         raise api_error(409, "DUPLICATE_COMMITMENT", "该承诺哈希已在此事件中提交过")
     return commitment_out(commitment)
+
+
+@app.post(
+    "/events/{event_id}/commitments/batch",
+    status_code=201,
+    response_model=CommitmentBatchOut,
+)
+def submit_commitments_batch(
+    event_id: UUID, payload: CommitmentBatchCreate, db: Session = Depends(get_db)
+):
+    """在单个数据库事务中原子批量提交 1～100 个承诺。
+
+    所有写入前的校验按输入顺序完成，任何一项冲突即整体回滚（不留下
+    部分承诺），并返回 409 与逐项冲突清单：
+      - INVALID_FORMAT：不是 64 位十六进制哈希
+      - DUPLICATE_IN_REQUEST：在本次请求内部重复（第二次及以后出现的下标）
+      - DUPLICATE_COMMITMENT：数据库中该事件已有此哈希
+    格式非法优先于重复判定；冲突清单按下标升序，每个下标至多一项。
+    全部通过时按输入顺序创建，并以相同顺序返回记录。
+    """
+    event = get_event_or_404(db, event_id)
+    now = now_utc()
+    commit_dl = as_utc(event.commit_deadline)
+    if now >= commit_dl:
+        raise api_error(
+            409,
+            "COMMIT_PHASE_CLOSED",
+            f"提交截止时间为 {commit_dl.isoformat()}，当前服务端时间 {now.isoformat()}，迟到提交被拒绝",
+        )
+
+    raw_hashes = payload.commitment_hashes
+    normalized = [h.lower() for h in raw_hashes]
+    conflicts: list[dict] = []
+
+    # 1) 按输入顺序校验格式
+    valid_format: list[bool] = []
+    for i, h in enumerate(raw_hashes):
+        ok = re.fullmatch(COMMITMENT_HASH_PATTERN, h) is not None
+        valid_format.append(ok)
+        if not ok:
+            conflicts.append({"index": i, "type": INVALID_FORMAT, "commitment_hash": h})
+
+    # 2) 按输入顺序检查请求内重复（仅对格式合法的项；保留首次出现）
+    seen_in_request: set[str] = set()
+    first_index: dict[str, int] = {}  # 归一化哈希 -> 请求内首次出现下标
+    for i, norm in enumerate(normalized):
+        if not valid_format[i]:
+            continue
+        if norm in seen_in_request:
+            conflicts.append(
+                {"index": i, "type": DUPLICATE_IN_REQUEST, "commitment_hash": raw_hashes[i]}
+            )
+            continue
+        seen_in_request.add(norm)
+        first_index[norm] = i
+
+    # 3) 同事务内一次性查询数据库中已存在的哈希；仅在请求内首次出现的
+    #    下标上报库冲突，后续重复已归为 DUPLICATE_IN_REQUEST
+    if first_index:
+        existing_rows = (
+            db.query(Commitment.commitment_hash)
+            .filter(
+                Commitment.event_id == event.id,
+                Commitment.commitment_hash.in_(list(first_index)),
+            )
+            .all()
+        )
+        existing = {row[0] for row in existing_rows}
+        for norm, i in first_index.items():
+            if norm in existing:
+                conflicts.append(
+                    {"index": i, "type": DUPLICATE_COMMITMENT, "commitment_hash": raw_hashes[i]}
+                )
+
+    if conflicts:
+        # 尚未执行任何 INSERT：显式回滚以结束事务，保证不留任何写入
+        db.rollback()
+        conflicts.sort(key=lambda c: c["index"])
+        raise api_error(
+            409,
+            "BATCH_COMMITMENT_CONFLICT",
+            f"批量提交包含 {len(conflicts)} 个冲突项，已整体回滚，未创建任何承诺",
+            conflicts=conflicts,
+        )
+
+    # 4) 全部通过：按输入顺序在同一事务中创建
+    commitments = [
+        Commitment(event_id=event.id, commitment_hash=norm) for norm in normalized
+    ]
+    db.add_all(commitments)
+    try:
+        db.commit()
+    except IntegrityError:
+        # 并发竞争：预检后、提交前另一事务写入了相同哈希。回滚并重新
+        # 读取冲突项，依旧给出逐项清单，保证不留下部分承诺
+        db.rollback()
+        existing_rows = (
+            db.query(Commitment.commitment_hash)
+            .filter(
+                Commitment.event_id == event.id,
+                Commitment.commitment_hash.in_(normalized),
+            )
+            .all()
+        )
+        existing = {row[0] for row in existing_rows}
+        race_conflicts = [
+            {"index": i, "type": DUPLICATE_COMMITMENT, "commitment_hash": raw_hashes[i]}
+            for i, norm in enumerate(normalized)
+            if norm in existing
+        ]
+        race_conflicts.sort(key=lambda c: c["index"])
+        raise api_error(
+            409,
+            "BATCH_COMMITMENT_CONFLICT",
+            f"批量提交包含 {len(race_conflicts)} 个冲突项，已整体回滚，未创建任何承诺",
+            conflicts=race_conflicts,
+        )
+
+    return CommitmentBatchOut(
+        count=len(commitments),
+        commitments=[commitment_out(c) for c in commitments],
+    )
 
 
 @app.get("/events/{event_id}/commitments", response_model=list[CommitmentOut])

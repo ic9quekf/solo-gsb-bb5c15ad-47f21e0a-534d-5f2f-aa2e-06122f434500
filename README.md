@@ -52,6 +52,7 @@ curl -s -X POST http://localhost:8000/utils/commitment \
 | GET | `/events/{id}` | 事件详情 |
 | POST | `/events/conflicts` | 批量事件的阶段窗口冲突分析（sweep-line） |
 | POST | `/events/{id}/commitments` | 提交承诺（64 位十六进制哈希） |
+| POST | `/events/{id}/commitments/batch` | 原子批量提交 1～100 个承诺（单事务，冲突整体回滚） |
 | GET | `/events/{id}/commitments` | 承诺列表（含是否已揭示） |
 | POST | `/events/{id}/reveals` | 揭示：提交原文 + 盐，服务端重算校验 |
 | GET | `/events/{id}/timeline` | 可核验的事件时间线 |
@@ -137,6 +138,63 @@ curl -s -X POST http://localhost:8000/events/conflicts \
 `{"generated_at": "...", "phases": ["commit", "reveal"], "count": 0, "segments": []}`。
 请求中的重复 ID 自动去重；任一 ID 不存在返回 `404 EVENT_NOT_FOUND`；非 UUID 返回 422。
 
+## 原子批量提交承诺（`POST /events/{id}/commitments/batch`）
+
+在**单个数据库事务**中按输入顺序提交 1～100 个承诺哈希。服务端在写入前完成全部校验，
+**任何一项冲突都整体回滚**，不会留下部分承诺：
+
+- 逐项校验哈希格式（64 位十六进制，大小写均可，存储时归一化为小写）；
+- 检查请求内重复（第二次及以后出现的下标记为请求内重复，大小写不敏感）；
+- 一次性查询数据库中该事件已有的哈希。
+
+冲突时返回 `409 BATCH_COMMITMENT_CONFLICT`，统一错误结构内附 `conflicts` 数组，
+每项给出 `index`（从 0 开始的输入下标）、`type` 与提交时的原始哈希，按下标升序、
+每个下标至多一项：
+
+| 冲突 type | 含义 |
+|-----------|------|
+| `INVALID_FORMAT` | 不是 64 位十六进制哈希 |
+| `DUPLICATE_IN_REQUEST` | 同一哈希在本次请求中重复（首次出现之后的下标） |
+| `DUPLICATE_COMMITMENT` | 数据库中该事件已存在此哈希（请求内首次出现的下标） |
+
+```bash
+# 成功：按输入顺序创建，返回 count 与承诺记录（201）
+curl -s -X POST http://localhost:8000/events/<EVENT_ID>/commitments/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"commitment_hashes": [
+        "9f2c7fd25e1b3afad3e85a0bd17d9b100db4b3bd306a4f6e5535e23e15e82d7d",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      ]}'
+# => {"count": 2, "commitments": [{...}, {...}]}
+
+# 冲突：整体回滚（409），逐项指出冲突下标与类型
+curl -s -X POST http://localhost:8000/events/<EVENT_ID>/commitments/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"commitment_hashes": [
+        "9f2c7fd25e1b3afad3e85a0bd17d9b100db4b3bd306a4f6e5535e23e15e82d7d",
+        "not-a-valid-hash",
+        "9f2c7fd25e1b3afad3e85a0bd17d9b100db4b3bd306a4f6e5535e23e15e82d7d"
+      ]}'
+```
+
+```json
+{
+  "detail": {
+    "code": "BATCH_COMMITMENT_CONFLICT",
+    "message": "批量提交包含 2 个冲突项，已整体回滚，未创建任何承诺",
+    "conflicts": [
+      {"index": 1, "type": "INVALID_FORMAT", "commitment_hash": "not-a-valid-hash"},
+      {"index": 2, "type": "DUPLICATE_IN_REQUEST",
+       "commitment_hash": "9f2c7fd25e1b3afad3e85a0bd17d9b100db4b3bd306a4f6e5535e23e15e82d7d"}
+    ]
+  }
+}
+```
+
+列表为空或超过 100 项返回 422；事件不存在返回 `404 EVENT_NOT_FOUND`；
+已过 `commit_deadline` 与单个提交端点一致返回 `409 COMMIT_PHASE_CLOSED`，
+以上情形同样不产生任何写入。
+
 ## 错误响应
 
 错误统一返回 `{"detail": {"code": "...", "message": "..."}}`，且**均不改变任何状态**
@@ -147,7 +205,8 @@ curl -s -X POST http://localhost:8000/events/conflicts \
 | 400 | `INVALID_DEADLINES` | 截止时间顺序非法或 commit_deadline 不在未来 |
 | 404 | `EVENT_NOT_FOUND` | 事件不存在（含冲突分析请求中的任一 ID） |
 | 409 | `COMMIT_PHASE_CLOSED` | 迟到提交（已过 commit_deadline） |
-| 409 | `DUPLICATE_COMMITMENT` | 同一事件内重复的承诺哈希 |
+| 409 | `DUPLICATE_COMMITMENT` | 同一事件内重复的承诺哈希（单个提交端点） |
+| 409 | `BATCH_COMMITMENT_CONFLICT` | 批量提交存在逐项冲突（`detail.conflicts` 给出每个冲突项的 index/type/hash） |
 | 409 | `REVEAL_PHASE_NOT_STARTED` | 提前揭示（未到 commit_deadline） |
 | 409 | `REVEAL_PHASE_CLOSED` | 逾期揭示（已过 reveal_deadline） |
 | 409 | `NO_MATCHING_COMMITMENT` | 原文 + 盐重算后不匹配任何承诺 |

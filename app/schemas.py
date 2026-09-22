@@ -29,6 +29,15 @@ class CommitmentCreate(BaseModel):
     )
 
 
+class CommitmentBatchCreate(BaseModel):
+    # 元素不在这里做 pattern 校验：格式非法是逐项冲突（409）而非请求体 422
+    commitment_hashes: list[str] = Field(
+        min_length=1,
+        max_length=100,
+        description="1～100 个 SHA-256 承诺值（64 位十六进制），按输入顺序在同一事务中原子提交",
+    )
+
+
 class RevealCreate(BaseModel):
     original_text: str = Field(description="预测原文（UTF-8）")
     salt: str = Field(min_length=1, max_length=256, description="随机盐（UTF-8）")
@@ -52,6 +61,11 @@ class CommitmentOut(BaseModel):
     commitment_hash: str
     created_at: datetime
     revealed: bool
+
+
+class CommitmentBatchOut(BaseModel):
+    count: int = Field(description="本次创建的承诺数量（等于输入哈希数量）")
+    commitments: list[CommitmentOut] = Field(description="按输入顺序创建的承诺记录")
 
 
 class RevealOut(BaseModel):
