@@ -21,6 +21,8 @@ from .database import Base, engine, get_db
 from .hashing import HASH_SCHEME, compute_commitment
 from .models import Commitment, Event, Reveal
 from .schemas import (
+    CommitmentBatchCreate,
+    CommitmentBatchOut,
     CommitmentCreate,
     CommitmentOut,
     ConflictRequest,
@@ -261,6 +263,90 @@ def submit_commitment(event_id: UUID, payload: CommitmentCreate, db: Session = D
         db.rollback()
         raise api_error(409, "DUPLICATE_COMMITMENT", "该承诺哈希已在此事件中提交过")
     return commitment_out(commitment)
+
+
+def find_existing_hashes(db: Session, event_id: UUID, hashes: list[str]) -> set[str]:
+    """查询本事件中已存在于数据库的承诺哈希（入参应已归一化为小写）。"""
+    rows = (
+        db.query(Commitment.commitment_hash)
+        .filter(Commitment.event_id == event_id, Commitment.commitment_hash.in_(hashes))
+        .all()
+    )
+    return {row[0] for row in rows}
+
+
+def collect_batch_conflicts(hashes: list[str], existing: set[str]) -> list[dict]:
+    """按输入顺序找出全部冲突项：数据库已存在优先，其次请求内重复。
+
+    每个冲突下标只报告一次，类型为 already_exists | duplicate_in_request。
+    """
+    conflicts: list[dict] = []
+    seen: set[str] = set()
+    for index, h in enumerate(hashes):
+        if h in existing:
+            conflict_type = "already_exists"
+        elif h in seen:
+            conflict_type = "duplicate_in_request"
+        else:
+            seen.add(h)
+            continue
+        conflicts.append({"index": index, "type": conflict_type, "commitment_hash": h})
+    return conflicts
+
+
+def batch_conflict_error(conflicts: list[dict]) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "code": "DUPLICATE_COMMITMENT",
+            "message": f"批量提交包含 {len(conflicts)} 个冲突承诺，已整体回滚，未创建任何承诺",
+            "conflicts": conflicts,
+        },
+    )
+
+
+@app.post(
+    "/events/{event_id}/commitments/batch",
+    status_code=201,
+    response_model=CommitmentBatchOut,
+)
+def submit_commitments_batch(
+    event_id: UUID, payload: CommitmentBatchCreate, db: Session = Depends(get_db)
+):
+    """原子批量提交 1～100 个承诺：任一冲突整体回滚，不留下部分承诺。"""
+    event = get_event_or_404(db, event_id)
+    now = now_utc()
+    commit_dl = as_utc(event.commit_deadline)
+    if now >= commit_dl:
+        raise api_error(
+            409,
+            "COMMIT_PHASE_CLOSED",
+            f"提交截止时间为 {commit_dl.isoformat()}，当前服务端时间 {now.isoformat()}，迟到提交被拒绝",
+        )
+
+    # 与单条提交一致：统一归一化为小写后再查重、落库
+    hashes = [h.lower() for h in payload.commitment_hashes]
+
+    # 同一事务内先校验（请求内重复 + 数据库已有），全部通过才写入
+    conflicts = collect_batch_conflicts(hashes, find_existing_hashes(db, event.id, hashes))
+    if conflicts:
+        raise batch_conflict_error(conflicts)
+
+    commitments = [Commitment(event_id=event.id, commitment_hash=h) for h in hashes]
+    db.add_all(commitments)
+    try:
+        db.commit()
+    except IntegrityError:
+        # 并发下其它请求抢先提交了相同哈希：整体回滚，重新核对后报告冲突项
+        db.rollback()
+        conflicts = collect_batch_conflicts(hashes, find_existing_hashes(db, event.id, hashes))
+        raise batch_conflict_error(conflicts)
+
+    return CommitmentBatchOut(
+        event_id=event.id,
+        count=len(commitments),
+        commitments=[commitment_out(c) for c in commitments],
+    )
 
 
 @app.get("/events/{event_id}/commitments", response_model=list[CommitmentOut])

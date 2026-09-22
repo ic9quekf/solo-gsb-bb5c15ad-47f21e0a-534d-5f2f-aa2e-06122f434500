@@ -177,6 +177,98 @@ def test_full_lifecycle():
         assert r.status_code == 404
 
 
+def test_batch_commitments():
+    with client:  # 触发 lifespan 建表
+        # --- 准备：全新事件，提交窗口内 -----------------------------------
+        clock.t = T0 + timedelta(hours=10)
+        commit_dl = clock.t + timedelta(hours=1)
+        reveal_dl = clock.t + timedelta(hours=2)
+        r = client.post("/events", json={
+            "title": "批量提交事件",
+            "commit_deadline": iso(commit_dl),
+            "reveal_deadline": iso(reveal_dl),
+        })
+        assert r.status_code == 201, r.text
+        event_id = r.json()["id"]
+        url = f"/events/{event_id}/commitments/batch"
+
+        h1 = "a" * 64
+        h2 = "b" * 64
+        h3 = "c" * 64
+        h4 = "d" * 64
+        h5 = "e" * 64
+
+        # --- 全部合法 -> 201，按输入顺序创建，大小写归一化 -------------------
+        r = client.post(url, json={"commitment_hashes": [h1, h2.upper(), h3]})
+        assert r.status_code == 201, r.text
+        body = r.json()
+        assert body["event_id"] == event_id
+        assert body["count"] == 3
+        assert [c["commitment_hash"] for c in body["commitments"]] == [h1, h2, h3]
+        assert len({c["id"] for c in body["commitments"]}) == 3
+        assert all(c["event_id"] == event_id and not c["revealed"] for c in body["commitments"])
+
+        r = client.get(f"/events/{event_id}")
+        assert r.json()["commitment_count"] == 3
+        r = client.get(f"/events/{event_id}/commitments")
+        assert [c["commitment_hash"] for c in r.json()] == [h1, h2, h3]
+
+        # --- 混合冲突：数据库已有 + 请求内重复 -> 409，整体回滚 --------------
+        r = client.post(url, json={"commitment_hashes": [h4, h1, h5, h4, h2.upper()]})
+        assert r.status_code == 409, r.text
+        detail = r.json()["detail"]
+        assert detail["code"] == "DUPLICATE_COMMITMENT"
+        assert detail["message"]
+        assert detail["conflicts"] == [
+            {"index": 1, "type": "already_exists", "commitment_hash": h1},
+            {"index": 3, "type": "duplicate_in_request", "commitment_hash": h4},
+            {"index": 4, "type": "already_exists", "commitment_hash": h2},
+        ]
+        # 不得留下部分承诺：h4、h5 均未落库
+        r = client.get(f"/events/{event_id}")
+        assert r.json()["commitment_count"] == 3
+
+        # --- 仅请求内重复（大小写不敏感）-> 409 ------------------------------
+        r = client.post(url, json={"commitment_hashes": [h4, h4.upper()]})
+        assert r.status_code == 409
+        assert r.json()["detail"]["conflicts"] == [
+            {"index": 1, "type": "duplicate_in_request", "commitment_hash": h4},
+        ]
+        r = client.get(f"/events/{event_id}")
+        assert r.json()["commitment_count"] == 3
+
+        # --- 冲突解决后可再次提交 -------------------------------------------
+        r = client.post(url, json={"commitment_hashes": [h4, h5]})
+        assert r.status_code == 201 and r.json()["count"] == 2
+        r = client.get(f"/events/{event_id}")
+        assert r.json()["commitment_count"] == 5
+
+        # --- 数量边界：空列表 / 超过 100 -> 422 ------------------------------
+        r = client.post(url, json={"commitment_hashes": []})
+        assert r.status_code == 422
+        r = client.post(url, json={"commitment_hashes": [f"{i:064x}" for i in range(101)]})
+        assert r.status_code == 422
+        r = client.post(url, json={"commitment_hashes": [f"{i:064x}" for i in range(100)]})
+        assert r.status_code == 201 and r.json()["count"] == 100
+
+        # --- 格式非法 -> 422，与单条提交一致 ---------------------------------
+        r = client.post(url, json={"commitment_hashes": ["xyz"]})
+        assert r.status_code == 422
+
+        # --- 事件不存在 -> 404 ----------------------------------------------
+        missing = "00000000-0000-0000-0000-000000000000"
+        r = client.post(f"/events/{missing}/commitments/batch",
+                        json={"commitment_hashes": ["f" * 64]})
+        assert r.status_code == 404 and r.json()["detail"]["code"] == "EVENT_NOT_FOUND"
+
+        # --- 超过提交截止 -> 409，状态不变 ------------------------------------
+        clock.t = commit_dl
+        r = client.post(url, json={"commitment_hashes": ["f" * 64]})
+        assert r.status_code == 409 and r.json()["detail"]["code"] == "COMMIT_PHASE_CLOSED"
+        r = client.get(f"/events/{event_id}")
+        assert r.json()["commitment_count"] == 105
+
+
 def test_health():
     with client:
         assert client.get("/health").json() == {"status": "ok"}
